@@ -22,7 +22,6 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -86,21 +85,48 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
 
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+		rayClusterGVR := schema.GroupVersionResource{
+			Group:    "ray.io",
+			Version:  "v1",
+			Resource: "rayclusters",
+		}
 
+		watcher, err := dyn.Resource(rayClusterGVR).Namespace(namespace).Watch(ctx, metav1.ListOptions{
+			FieldSelector: "metadata.name=" + name,
+		})
+		if err != nil {
+			log.Fatalf("Failed to create watcher: %v", err)
+		}
+		defer watcher.Stop()
+
+		var creationTime time.Time
 	L:
 		for {
 			select {
 			case <-ctx.Done():
 				log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
-			case <-ticker.C:
-				duration, err := getRayClusterReadyDuration(context.Background(), dyn, namespace, name)
-				if err != nil {
-					log.Printf("Waiting for cluster to be ready: %v", err)
+			case event := <-watcher.ResultChan():
+				unstructuredObj, ok := event.Object.(*unstructured.Unstructured)
+				if !ok {
+					log.Printf("unexpected type %T, skipping", event.Object)
 					continue
 				}
-				log.Printf("RayCluster '%s' took %s to become ready.", name, duration)
+				if creationTime.IsZero() {
+					creationTime = unstructuredObj.GetCreationTimestamp().Time
+					if creationTime.IsZero() {
+						continue // Wait for creation timestamp to be set
+					}
+				}
+				readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
+				if err != nil || !found {
+					continue // Not ready yet, continue polling
+				}
+				readyTime, err := time.Parse(time.RFC3339, readyTimeStr)
+				if err != nil {
+					log.Printf("Error parsing time: %v", err)
+					continue
+				}
+				log.Printf("RayCluster '%s' took %s to become ready.", name, readyTime.Sub(creationTime))
 				break L
 			}
 		}
@@ -119,52 +145,6 @@ func main() {
 
 // getRayClusterReadyDuration fetches the specified RayCluster and calculates how long it took
 // for it to become 'ready' by comparing the creationTimestamp to the 'ready' stateTransitionTime.
-func getRayClusterReadyDuration(ctx context.Context, dynamicClient dynamic.Interface, namespace, name string) (time.Duration, error) {
-	rayClusterGVR := schema.GroupVersionResource{
-		Group:    "ray.io",
-		Version:  "v1",
-		Resource: "rayclusters",
-	}
-
-	var creationTime time.Time
-	var readyTime time.Time
-
-	// Poll until the 'ready' state transition time is found
-	err := wait.PollImmediate(2*time.Second, 5*time.Minute, func() (bool, error) {
-		unstructuredObj, err := dynamicClient.Resource(rayClusterGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return false, err
-		}
-
-		// Get creation timestamp
-		if creationTime.IsZero() {
-			creationTime = unstructuredObj.GetCreationTimestamp().Time
-			if creationTime.IsZero() {
-				return false, nil // Wait for creation timestamp to be set
-			}
-		}
-
-		// Check for ready state transition time
-		readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
-		if err != nil || !found {
-			return false, nil // Not ready yet, continue polling
-		}
-
-		readyTime, err = time.Parse(time.RFC3339, readyTimeStr)
-		if err != nil {
-			return false, err // Error parsing time
-		}
-
-		return true, nil // Ready, exit polling
-	})
-
-	if err != nil {
-		return 0, err
-	}
-
-	return readyTime.Sub(creationTime), nil
-}
-
 func ApplyYaml(ctx context.Context, cfg *rest.Config, cs *kubernetes.Clientset, yamlContent []byte) error {
 	dec := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
@@ -248,4 +228,3 @@ func deleteRayCluster(ctx context.Context, cfg *rest.Config, yamlContent []byte)
 	}
 	return nil
 }
-
