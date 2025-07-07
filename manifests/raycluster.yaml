@@ -1,0 +1,52 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-complete
+  namespace: default
+spec:
+  rayVersion: '2.40.0'  # should match the Ray version in the image of the containers
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.40.0
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265  # Ray dashboard
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2G"
+            requests:
+              cpu: "1"
+              memory: "2G"
+  workerGroupSpecs:
+  - replicas: 2
+    minReplicas: 1
+    maxReplicas: 3
+    groupName: small-group
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.40.0
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "ray stop"]
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1G"
+            requests:
+              cpu: "1"
+              memory: "1G"
+
