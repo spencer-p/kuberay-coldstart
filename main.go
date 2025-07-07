@@ -64,71 +64,25 @@ func main() {
 	}
 	name := obj.GetName()
 
+	runBenchmark(config, clientset, yamlFile, namespace, name)
+}
+
+func runBenchmark(config *rest.Config, clientset *kubernetes.Clientset, yamlFile []byte, namespace, name string) {
 	for i := 0; i < 10; i++ {
 		log.Printf("Iteration %d", i+1)
 
 		// Apply the YAML
-		err = ApplyYaml(context.Background(), config, clientset, yamlFile)
+		err := ApplyYaml(context.Background(), config, clientset, yamlFile)
 		if err != nil {
 			log.Fatalf("Error applying YAML: %s", err.Error())
 		}
 
 		log.Printf("Successfully applied manifests/raycluster.yaml: %s/%s", namespace, name)
 
-		// Create dynamic client for fetching the applied resource
-		dyn, err := dynamic.NewForConfig(config)
-		if err != nil {
-			log.Fatalf("Error creating dynamic client: %s", err.Error())
-		}
-
 		// Poll for readiness duration
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		defer cancel()
-
-		rayClusterGVR := schema.GroupVersionResource{
-			Group:    "ray.io",
-			Version:  "v1",
-			Resource: "rayclusters",
-		}
-
-		watcher, err := dyn.Resource(rayClusterGVR).Namespace(namespace).Watch(ctx, metav1.ListOptions{
-			FieldSelector: "metadata.name=" + name,
-		})
+		err = getRayClusterReadyLatency(config, namespace, name)
 		if err != nil {
-			log.Fatalf("Failed to create watcher: %v", err)
-		}
-		defer watcher.Stop()
-
-		var creationTime time.Time
-	L:
-		for {
-			select {
-			case <-ctx.Done():
-				log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
-			case event := <-watcher.ResultChan():
-				unstructuredObj, ok := event.Object.(*unstructured.Unstructured)
-				if !ok {
-					log.Printf("unexpected type %T, skipping", event.Object)
-					continue
-				}
-				if creationTime.IsZero() {
-					creationTime = unstructuredObj.GetCreationTimestamp().Time
-					if creationTime.IsZero() {
-						continue // Wait for creation timestamp to be set
-					}
-				}
-				readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
-				if err != nil || !found {
-					continue // Not ready yet, continue polling
-				}
-				readyTime, err := time.Parse(time.RFC3339, readyTimeStr)
-				if err != nil {
-					log.Printf("Error parsing time: %v", err)
-					continue
-				}
-				log.Printf("RayCluster '%s' took %s to become ready.", name, readyTime.Sub(creationTime))
-				break L
-			}
+			log.Fatalf("Error getting RayCluster ready latency: %s", err.Error())
 		}
 
 		// Delete the RayCluster
@@ -143,8 +97,65 @@ func main() {
 	}
 }
 
-// getRayClusterReadyDuration fetches the specified RayCluster and calculates how long it took
-// for it to become 'ready' by comparing the creationTimestamp to the 'ready' stateTransitionTime.
+func getRayClusterReadyLatency(config *rest.Config, namespace, name string) error {
+	// Create dynamic client for fetching the applied resource
+	dyn, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	// Poll for readiness duration
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	rayClusterGVR := schema.GroupVersionResource{
+		Group:    "ray.io",
+		Version:  "v1",
+		Resource: "rayclusters",
+	}
+
+	watcher, err := dyn.Resource(rayClusterGVR).Namespace(namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector: "metadata.name=" + name,
+	})
+	if err != nil {
+		return err
+	}
+	defer watcher.Stop()
+
+	var creationTime time.Time
+L:
+	for {
+		select {
+		case <-ctx.Done():
+			log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
+		case event := <-watcher.ResultChan():
+			unstructuredObj, ok := event.Object.(*unstructured.Unstructured)
+			if !ok {
+				log.Printf("unexpected type %T, skipping", event.Object)
+				continue
+			}
+			if creationTime.IsZero() {
+				creationTime = unstructuredObj.GetCreationTimestamp().Time
+				if creationTime.IsZero() {
+					continue // Wait for creation timestamp to be set
+				}
+			}
+			readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
+			if err != nil || !found {
+				continue // Not ready yet, continue polling
+			}
+			readyTime, err := time.Parse(time.RFC3339, readyTimeStr)
+			if err != nil {
+				log.Printf("Error parsing time: %v", err)
+				continue
+			}
+			log.Printf("RayCluster '%s' took %s to become ready.", name, readyTime.Sub(creationTime))
+			break L
+		}
+	}
+	return nil
+}
+
 func ApplyYaml(ctx context.Context, cfg *rest.Config, cs *kubernetes.Clientset, yamlContent []byte) error {
 	dec := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
