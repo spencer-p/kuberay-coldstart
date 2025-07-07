@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -64,40 +65,55 @@ func main() {
 	}
 	name := obj.GetName()
 
-	// Apply the YAML
-	err = ApplyYaml(context.Background(), config, clientset, yamlFile)
-	if err != nil {
-		log.Fatalf("Error applying YAML: %s", err.Error())
-	}
+	for i := 0; i < 10; i++ {
+		log.Printf("Iteration %d", i+1)
 
-	log.Printf("Successfully applied manifests/raycluster.yaml: %s/%s", namespace, name)
-
-	// Create dynamic client for fetching the applied resource
-	dyn, err := dynamic.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Error creating dynamic client: %s", err.Error())
-	}
-
-	// Poll for readiness duration
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
-		case <-ticker.C:
-			duration, err := getRayClusterReadyDuration(context.Background(), dyn, namespace, name)
-			if err != nil {
-				log.Printf("Waiting for cluster to be ready: %v", err)
-				continue
-			}
-			log.Printf("RayCluster '%s' took %s to become ready.", name, duration)
-			return
+		// Apply the YAML
+		err = ApplyYaml(context.Background(), config, clientset, yamlFile)
+		if err != nil {
+			log.Fatalf("Error applying YAML: %s", err.Error())
 		}
+
+		log.Printf("Successfully applied manifests/raycluster.yaml: %s/%s", namespace, name)
+
+		// Create dynamic client for fetching the applied resource
+		dyn, err := dynamic.NewForConfig(config)
+		if err != nil {
+			log.Fatalf("Error creating dynamic client: %s", err.Error())
+		}
+
+		// Poll for readiness duration
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+	L:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
+			case <-ticker.C:
+				duration, err := getRayClusterReadyDuration(context.Background(), dyn, namespace, name)
+				if err != nil {
+					log.Printf("Waiting for cluster to be ready: %v", err)
+					continue
+				}
+				log.Printf("RayCluster '%s' took %s to become ready.", name, duration)
+				break L
+			}
+		}
+
+		// Delete the RayCluster
+		err = deleteRayCluster(context.Background(), config, yamlFile)
+		if err != nil {
+			log.Fatalf("Error deleting RayCluster: %s", err.Error())
+		}
+		log.Printf("Successfully deleted RayCluster: %s/%s", namespace, name)
+
+		// Wait a bit before the next iteration
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -110,24 +126,40 @@ func getRayClusterReadyDuration(ctx context.Context, dynamicClient dynamic.Inter
 		Resource: "rayclusters",
 	}
 
-	unstructuredObj, err := dynamicClient.Resource(rayClusterGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	var creationTime time.Time
+	var readyTime time.Time
+
+	// Poll until the 'ready' state transition time is found
+	err := wait.PollImmediate(2*time.Second, 5*time.Minute, func() (bool, error) {
+		unstructuredObj, err := dynamicClient.Resource(rayClusterGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		// Get creation timestamp
+		if creationTime.IsZero() {
+			creationTime = unstructuredObj.GetCreationTimestamp().Time
+			if creationTime.IsZero() {
+				return false, nil // Wait for creation timestamp to be set
+			}
+		}
+
+		// Check for ready state transition time
+		readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
+		if err != nil || !found {
+			return false, nil // Not ready yet, continue polling
+		}
+
+		readyTime, err = time.Parse(time.RFC3339, readyTimeStr)
+		if err != nil {
+			return false, err // Error parsing time
+		}
+
+		return true, nil // Ready, exit polling
+	})
+
 	if err != nil {
-		return 0, log.Default().Output(2, "failed to get RayCluster")
-	}
-
-	creationTime := unstructuredObj.GetCreationTimestamp().Time
-	if creationTime.IsZero() {
-		return 0, log.Default().Output(2, "creationTimestamp not found")
-	}
-
-	readyTimeStr, found, err := unstructured.NestedString(unstructuredObj.Object, "status", "stateTransitionTimes", "ready")
-	if err != nil || !found {
-		return 0, log.Default().Output(2, "'ready' state transition time not found in status")
-	}
-
-	readyTime, err := time.Parse(time.RFC3339, readyTimeStr)
-	if err != nil {
-		return 0, log.Default().Output(2, "failed to parse ready time")
+		return 0, err
 	}
 
 	return readyTime.Sub(creationTime), nil
@@ -168,6 +200,48 @@ func ApplyYaml(ctx context.Context, cfg *rest.Config, cs *kubernetes.Clientset, 
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
 			log.Printf("resource %s already exists, continuing...", obj.GetName())
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func deleteRayCluster(ctx context.Context, cfg *rest.Config, yamlContent []byte) error {
+	dec := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return err
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
+
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	obj := &unstructured.Unstructured{}
+	_, gvk, err := dec.Decode(yamlContent, nil, obj)
+	if err != nil {
+		return err
+	}
+
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return err
+	}
+
+	var dr dynamic.ResourceInterface
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		dr = dyn.Resource(mapping.Resource).Namespace(obj.GetNamespace())
+	} else {
+		dr = dyn.Resource(mapping.Resource)
+	}
+
+	err = dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Printf("resource %s not found, continuing...", obj.GetName())
 			return nil
 		}
 		return err
