@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -45,6 +49,21 @@ func main() {
 		log.Fatalf("Error creating clientset: %s", err.Error())
 	}
 
+	// Setup CSV writer
+	csvFile, err := os.Create("benchmark_results.csv")
+	if err != nil {
+		log.Fatalf("failed creating file: %s", err)
+	}
+	defer csvFile.Close()
+
+	csvWriter := csv.NewWriter(csvFile)
+	defer csvWriter.Flush()
+
+	header := []string{"CreationTimestamp", "ReadyTimestamp", "LatencySeconds"}
+	if err := csvWriter.Write(header); err != nil {
+		log.Fatalf("Error writing header to CSV: %s", err.Error())
+	}
+
 	// Read the YAML file
 	yamlFile, err := ioutil.ReadFile("manifests/raycluster.yaml")
 	if err != nil {
@@ -64,11 +83,11 @@ func main() {
 	}
 	name := obj.GetName()
 
-	runBenchmark(config, clientset, yamlFile, namespace, name)
+	runBenchmark(config, clientset, yamlFile, namespace, name, csvWriter)
 }
 
-func runBenchmark(config *rest.Config, clientset *kubernetes.Clientset, yamlFile []byte, namespace, name string) {
-	for i := 0; i < 10; i++ {
+func runBenchmark(config *rest.Config, clientset *kubernetes.Clientset, yamlFile []byte, namespace, name string, csvWriter *csv.Writer) {
+	for i := 0; i < 100; i++ {
 		log.Printf("Iteration %d", i+1)
 
 		// Apply the YAML
@@ -80,10 +99,24 @@ func runBenchmark(config *rest.Config, clientset *kubernetes.Clientset, yamlFile
 		log.Printf("Successfully applied manifests/raycluster.yaml: %s/%s", namespace, name)
 
 		// Poll for readiness duration
-		err = getRayClusterReadyLatency(config, namespace, name)
+		creationTime, readyTime, err := getRayClusterReadyLatency(config, namespace, name)
 		if err != nil {
 			log.Fatalf("Error getting RayCluster ready latency: %s", err.Error())
 		}
+
+		latency := readyTime.Sub(creationTime)
+		log.Printf("RayCluster '%s' took %s to become ready.", name, latency)
+
+		// Write to CSV
+		record := []string{
+			creationTime.Format(time.RFC3339),
+			readyTime.Format(time.RFC3339),
+			strconv.FormatInt(int64(latency.Seconds()), 10),
+		}
+		if err := csvWriter.Write(record); err != nil {
+			log.Fatalf("failed writing record to csv: %s", err)
+		}
+		csvWriter.Flush()
 
 		// Delete the RayCluster
 		err = deleteRayCluster(context.Background(), config, yamlFile)
@@ -97,11 +130,11 @@ func runBenchmark(config *rest.Config, clientset *kubernetes.Clientset, yamlFile
 	}
 }
 
-func getRayClusterReadyLatency(config *rest.Config, namespace, name string) error {
+func getRayClusterReadyLatency(config *rest.Config, namespace, name string) (time.Time, time.Time, error) {
 	// Create dynamic client for fetching the applied resource
 	dyn, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return err
+		return time.Time{}, time.Time{}, err
 	}
 
 	// Poll for readiness duration
@@ -118,17 +151,22 @@ func getRayClusterReadyLatency(config *rest.Config, namespace, name string) erro
 		FieldSelector: "metadata.name=" + name,
 	})
 	if err != nil {
-		return err
+		return time.Time{}, time.Time{}, err
 	}
 	defer watcher.Stop()
 
 	var creationTime time.Time
-L:
 	for {
 		select {
 		case <-ctx.Done():
-			log.Fatalf("Timed out waiting for RayCluster %s to become ready", name)
+			return time.Time{}, time.Time{}, fmt.Errorf("timed out waiting for RayCluster %s to become ready", name)
 		case event := <-watcher.ResultChan():
+			if event.Object == nil {
+				if ctx.Err() != nil {
+					return time.Time{}, time.Time{}, ctx.Err()
+				}
+				return time.Time{}, time.Time{}, fmt.Errorf("watcher channel closed unexpectedly")
+			}
 			unstructuredObj, ok := event.Object.(*unstructured.Unstructured)
 			if !ok {
 				log.Printf("unexpected type %T, skipping", event.Object)
@@ -149,11 +187,9 @@ L:
 				log.Printf("Error parsing time: %v", err)
 				continue
 			}
-			log.Printf("RayCluster '%s' took %s to become ready.", name, readyTime.Sub(creationTime))
-			break L
+			return creationTime, readyTime, nil
 		}
 	}
-	return nil
 }
 
 func ApplyYaml(ctx context.Context, cfg *rest.Config, cs *kubernetes.Clientset, yamlContent []byte) error {
