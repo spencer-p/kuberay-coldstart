@@ -187,7 +187,7 @@ func getRayClusterReadyLatency(config *rest.Config, namespace, name string) (tim
 				log.Printf("Error parsing time: %v", err)
 				continue
 			}
-			return creationTime, readyTime, nil
+			return creationTime.UTC(), readyTime.UTC(), nil
 		}
 	}
 }
